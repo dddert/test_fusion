@@ -3,15 +3,13 @@
 Data Fusion Contest 2026 Task 2: quality-first training pipeline + EDA.
 Kaggle-friendly script (no argparse).
 
-Pipeline:
-1) Load (or download) data
-2) Run EDA report
-3) Feature hygiene (constant + ultra-missing drop)
-4) Train two ensembles:
-   - Multi-label CatBoost (MultiLogloss)
-   - One-vs-Rest CatBoost (Logloss/AUC)
-5) Learn best blend weight on OOF by Macro ROC-AUC
-6) Build submission.parquet
+Upgrades in this version:
+- EDA report
+- Feature hygiene: constant + ultra-missing + near-constant
+- Multi-label CatBoost ensemble + OvR CatBoost ensemble
+- OOF-driven blend search:
+  * global blend weight OR
+  * per-target blend weights (default, usually better for macro AUC)
 """
 
 from __future__ import annotations
@@ -29,25 +27,29 @@ from sklearn.model_selection import KFold
 # =========================
 # CONFIG (edit on Kaggle)
 # =========================
-DATA_DIR = Path("/kaggle/input/data-fusion-contest-2026/data")
+DATA_DIR = Path("/kaggle/input/datasets/hatab123/data-fusion-contest-2026")
 OUTPUT_PATH = Path("submission.parquet")
 EDA_REPORT_PATH = Path("eda_report.md")
+BLEND_WEIGHTS_REPORT_PATH = Path("blend_weights.csv")
 
 # If DATA_DIR does not exist, try kagglehub download.
 USE_KAGGLEHUB_DOWNLOAD = False
 KAGGLE_DATASET_ID = "hatab123/data-fusion-contest-2026"
 
-MULTI_FOLDS = 5
-OVR_FOLDS = 5
-MULTI_SEEDS = [42, 1337]
+MULTI_FOLDS = 2
+OVR_FOLDS = 2
+MULTI_SEEDS = [42]
 OVR_SEEDS = [2026]
 
-# If True, blend weight between Multi and OvR is optimized by OOF macro ROC-AUC.
+# Blend options
 AUTO_TUNE_BLEND_WEIGHT = True
+USE_PER_TARGET_BLEND = True  # recommended for macro AUC
 DEFAULT_BLEND_WEIGHT_MULTI = 0.65
 
 # Feature hygiene
 DROP_CONST_FEATURES = True
+DROP_NEAR_CONST_FEATURES = True
+NEAR_CONST_DOMINANCE_THRESHOLD = 0.9995
 MISSING_RATE_THRESHOLD = 0.997  # drop columns with >99.7% missing
 
 
@@ -58,6 +60,13 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 def logit(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     p = np.clip(p, eps, 1.0 - eps)
     return np.log(p / (1.0 - p))
+
+
+def safe_auc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    # For rare targets, a fold may be single-class. Return neutral 0.5 in that case.
+    if np.unique(y_true).shape[0] < 2:
+        return 0.5
+    return float(roc_auc_score(y_true, y_pred))
 
 
 def resolve_data_dir() -> Path:
@@ -144,6 +153,16 @@ def apply_feature_hygiene(train_df: pd.DataFrame, test_df: pd.DataFrame) -> Tupl
     else:
         const_cols = []
 
+    if DROP_NEAR_CONST_FEATURES:
+        near_const_cols = []
+        for col in feature_cols:
+            vc = train_df[col].value_counts(dropna=False, normalize=True)
+            if len(vc) > 0 and vc.iloc[0] >= NEAR_CONST_DOMINANCE_THRESHOLD:
+                near_const_cols.append(col)
+        drop_cols.update(near_const_cols)
+    else:
+        near_const_cols = []
+
     missing_rate = train_df[feature_cols].isna().mean()
     ultra_missing = missing_rate[missing_rate > MISSING_RATE_THRESHOLD].index.tolist()
     drop_cols.update(ultra_missing)
@@ -155,6 +174,7 @@ def apply_feature_hygiene(train_df: pd.DataFrame, test_df: pd.DataFrame) -> Tupl
     stats = {
         "dropped_total": len(drop_cols),
         "dropped_const": len(const_cols),
+        "dropped_near_const": len(near_const_cols),
         "dropped_ultra_missing": len(ultra_missing),
     }
     print(f"Feature hygiene stats: {stats}")
@@ -205,7 +225,7 @@ def train_multilabel_ensemble(
             model = CatBoostClassifier(
                 loss_function="MultiLogloss",
                 eval_metric="MultiLogloss",
-                iterations=8000,
+                iterations=10000,
                 learning_rate=0.028,
                 depth=8,
                 l2_leaf_reg=9.0,
@@ -292,7 +312,7 @@ def train_ovr_ensemble(
     return oof_pred, test_pred
 
 
-def find_best_blend_weight(y_true: pd.DataFrame, pred_multi_raw: np.ndarray, pred_ovr_raw: np.ndarray) -> Tuple[float, float]:
+def find_best_blend_weight_global(y_true: pd.DataFrame, pred_multi_raw: np.ndarray, pred_ovr_raw: np.ndarray) -> Tuple[float, float]:
     y_arr = y_true.values
     weights = np.linspace(0.0, 1.0, 21)
     best_w, best_auc = 0.5, -1.0
@@ -303,12 +323,49 @@ def find_best_blend_weight(y_true: pd.DataFrame, pred_multi_raw: np.ndarray, pre
     for w in weights:
         p_blend = w * p_multi + (1.0 - w) * p_ovr
         auc = roc_auc_score(y_arr, p_blend, average="macro")
-        print(f"Blend weight={w:.2f} | OOF macro AUC={auc:.6f}")
+        print(f"Global blend weight={w:.2f} | OOF macro AUC={auc:.6f}")
         if auc > best_auc:
             best_auc = auc
             best_w = float(w)
 
     return best_w, best_auc
+
+
+def find_best_blend_weight_per_target(
+    y_true: pd.DataFrame,
+    pred_multi_raw: np.ndarray,
+    pred_ovr_raw: np.ndarray,
+    target_names: List[str],
+) -> Tuple[np.ndarray, float, pd.DataFrame]:
+    y_arr = y_true.values
+    n_targets = y_arr.shape[1]
+    weights = np.linspace(0.0, 1.0, 21)
+
+    p_multi = sigmoid(pred_multi_raw)
+    p_ovr = sigmoid(pred_ovr_raw)
+
+    best_weights = np.zeros(n_targets, dtype=np.float64)
+    rows = []
+
+    for j in range(n_targets):
+        yj = y_arr[:, j]
+        best_w_j = 0.5
+        best_auc_j = -1.0
+        for w in weights:
+            pj = w * p_multi[:, j] + (1.0 - w) * p_ovr[:, j]
+            auc_j = safe_auc(yj, pj)
+            if auc_j > best_auc_j:
+                best_auc_j = auc_j
+                best_w_j = float(w)
+
+        best_weights[j] = best_w_j
+        rows.append({"target": target_names[j], "best_weight_multi": best_w_j, "oof_auc": best_auc_j})
+
+    p_blend = p_multi * best_weights.reshape(1, -1) + p_ovr * (1.0 - best_weights.reshape(1, -1))
+    macro_auc = roc_auc_score(y_arr, p_blend, average="macro")
+
+    report_df = pd.DataFrame(rows)
+    return best_weights, float(macro_auc), report_df
 
 
 def build_submission(sample_submit: pd.DataFrame, preds: np.ndarray, out_path: Path) -> None:
@@ -326,6 +383,7 @@ def main() -> None:
     print(f"  MULTI_FOLDS={MULTI_FOLDS}, OVR_FOLDS={OVR_FOLDS}")
     print(f"  MULTI_SEEDS={MULTI_SEEDS}, OVR_SEEDS={OVR_SEEDS}")
     print(f"  AUTO_TUNE_BLEND_WEIGHT={AUTO_TUNE_BLEND_WEIGHT}")
+    print(f"  USE_PER_TARGET_BLEND={USE_PER_TARGET_BLEND}")
 
     data_dir = resolve_data_dir()
     print(f"Using data dir: {data_dir}")
@@ -348,7 +406,8 @@ def main() -> None:
 
     x_train = train_full[feature_cols]
     x_test = test_full[feature_cols]
-    y_train = target.drop(columns=["customer_id"])
+    target_cols = [c for c in target.columns if c != "customer_id"]
+    y_train = target[target_cols]
 
     print("Training MultiLogloss ensemble...")
     oof_multi_raw, test_multi_raw = train_multilabel_ensemble(
@@ -370,17 +429,28 @@ def main() -> None:
         n_folds=OVR_FOLDS,
     )
 
-    if AUTO_TUNE_BLEND_WEIGHT:
-        best_w, best_auc = find_best_blend_weight(y_train, oof_multi_raw, oof_ovr_raw)
-        blend_w = best_w
-        print(f"Best OOF blend weight: {blend_w:.3f} | macro AUC={best_auc:.6f}")
-    else:
-        blend_w = DEFAULT_BLEND_WEIGHT_MULTI
-        print(f"Using default blend weight: {blend_w:.3f}")
-
     p_multi_test = sigmoid(test_multi_raw)
     p_ovr_test = sigmoid(test_ovr_raw)
-    p_blend_test = blend_w * p_multi_test + (1.0 - blend_w) * p_ovr_test
+
+    if AUTO_TUNE_BLEND_WEIGHT:
+        if USE_PER_TARGET_BLEND:
+            best_w_vec, macro_auc, report_df = find_best_blend_weight_per_target(
+                y_true=y_train,
+                pred_multi_raw=oof_multi_raw,
+                pred_ovr_raw=oof_ovr_raw,
+                target_names=target_cols,
+            )
+            report_df.to_csv(BLEND_WEIGHTS_REPORT_PATH, index=False)
+            print(f"Per-target blend tuned. OOF macro AUC={macro_auc:.6f}")
+            print(f"Saved blend weights report: {BLEND_WEIGHTS_REPORT_PATH}")
+            p_blend_test = p_multi_test * best_w_vec.reshape(1, -1) + p_ovr_test * (1.0 - best_w_vec.reshape(1, -1))
+        else:
+            best_w, best_auc = find_best_blend_weight_global(y_train, oof_multi_raw, oof_ovr_raw)
+            print(f"Best global blend weight={best_w:.3f} | OOF macro AUC={best_auc:.6f}")
+            p_blend_test = best_w * p_multi_test + (1.0 - best_w) * p_ovr_test
+    else:
+        print(f"Using default blend weight: {DEFAULT_BLEND_WEIGHT_MULTI:.3f}")
+        p_blend_test = DEFAULT_BLEND_WEIGHT_MULTI * p_multi_test + (1.0 - DEFAULT_BLEND_WEIGHT_MULTI) * p_ovr_test
 
     # Keep submission format consistent with previous solution (raw margins).
     pred_final = logit(p_blend_test)
