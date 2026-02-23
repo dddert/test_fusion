@@ -29,15 +29,15 @@ EDA_REPORT_PATH = Path("eda_report.md")
 BLEND_WEIGHTS_REPORT_PATH = Path("blend_weights.csv")
 
 # Runtime profile for ~12h H100
-MULTI_FOLDS = 3
-OVR_FOLDS = 2
-MULTI_SEEDS = [42, 2027]
+MULTI_FOLDS = 4
+OVR_FOLDS = 3
+MULTI_SEEDS = [42]
 OVR_SEEDS = [2026]
 
 # OvR target selection
 # rare_and_hard = ultra-rare by prevalence OR manually listed hard/high-impact targets
 OVR_TARGET_MODE = "rare_and_hard"  # one of: all, rare_only, rare_and_hard
-OVR_RARE_THRESHOLD = 0.005
+OVR_RARE_THRESHOLD = 0.01
 MANUAL_HARD_TARGETS = {
     "target_10_1", "target_9_6", "target_8_1", "target_3_1", "target_3_2",
     "target_7_1", "target_7_2", "target_9_7", "target_9_2", "target_8_2"
@@ -46,8 +46,8 @@ MANUAL_HARD_TARGETS = {
 # Blend controls
 AUTO_TUNE_BLEND_WEIGHT = True
 USE_PER_TARGET_BLEND = True
-MIN_OOF_GAIN_FOR_OVR = 0.0003
-BLEND_GRID = np.array([0.0, 0.25, 0.5, 0.75, 1.0])  # regularized grid to reduce overfit
+MIN_OOF_GAIN_FOR_OVR = 0.0002
+BLEND_GRID = np.array([0.0, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0])  # regularized grid to reduce overfit
 DEFAULT_BLEND_WEIGHT_MULTI = 0.8
 
 # Feature hygiene
@@ -207,8 +207,8 @@ def train_multilabel_ensemble(
             model = CatBoostClassifier(
                 loss_function="MultiLogloss",
                 eval_metric="MultiLogloss",
-                iterations=5600,
-                learning_rate=0.035,
+                iterations=6200,
+                learning_rate=0.032,
                 depth=8,
                 l2_leaf_reg=10.0,
                 random_strength=1.25,
@@ -217,7 +217,7 @@ def train_multilabel_ensemble(
                 bootstrap_type="Bayesian",
                 leaf_estimation_iterations=5,
                 od_type="Iter",
-                od_wait=260,
+                od_wait=320,
                 random_seed=seed,
                 task_type="GPU",
                 verbose=300,
@@ -237,10 +237,10 @@ def train_multilabel_ensemble(
 
 def ovr_params_for_target(prevalence: float) -> Dict[str, float]:
     if prevalence <= 0.002:
-        return {"iterations": 4200, "depth": 7, "learning_rate": 0.03, "l2_leaf_reg": 10.0, "od_wait": 170}
+        return {"iterations": 5200, "depth": 7, "learning_rate": 0.028, "l2_leaf_reg": 10.0, "od_wait": 220}
     if prevalence <= 0.01:
-        return {"iterations": 3000, "depth": 7, "learning_rate": 0.033, "l2_leaf_reg": 9.0, "od_wait": 150}
-    return {"iterations": 2000, "depth": 6, "learning_rate": 0.036, "l2_leaf_reg": 8.0, "od_wait": 130}
+        return {"iterations": 3800, "depth": 7, "learning_rate": 0.03, "l2_leaf_reg": 9.0, "od_wait": 180}
+    return {"iterations": 2600, "depth": 6, "learning_rate": 0.034, "l2_leaf_reg": 8.0, "od_wait": 150}
 
 
 def train_ovr_selected_targets(
