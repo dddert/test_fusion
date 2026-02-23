@@ -2,12 +2,11 @@
 """
 Data Fusion Contest 2026 Task 2: quality/time optimized pipeline for <=12h on H100.
 
-Key upgrades versus previous version:
-1) stronger Multi backbone with 3-fold single-seed default
-2) selective OvR only for rare/hard targets
-3) StratifiedKFold for OvR stability on rare labels
-4) OOF gain gate: if OvR does not beat Multi on OOF, fallback to Multi for that target
-5) per-target blend tuning on surviving OvR targets
+This revision focuses on pushing beyond 0.84 while keeping 12h budget:
+- stronger and more diverse Multi backbone (3 folds x 2 seeds)
+- selective OvR only for ultra-rare + truly hard targets
+- stratified OvR folds
+- regularized per-target blend (to reduce 2-fold OOF overfitting)
 """
 
 from __future__ import annotations
@@ -32,13 +31,13 @@ BLEND_WEIGHTS_REPORT_PATH = Path("blend_weights.csv")
 # Runtime profile for ~12h H100
 MULTI_FOLDS = 3
 OVR_FOLDS = 2
-MULTI_SEEDS = [42]
+MULTI_SEEDS = [42, 2027]
 OVR_SEEDS = [2026]
 
 # OvR target selection
-# rare_and_hard = rare by prevalence OR manually listed hard/high-impact targets
+# rare_and_hard = ultra-rare by prevalence OR manually listed hard/high-impact targets
 OVR_TARGET_MODE = "rare_and_hard"  # one of: all, rare_only, rare_and_hard
-OVR_RARE_THRESHOLD = 0.01
+OVR_RARE_THRESHOLD = 0.005
 MANUAL_HARD_TARGETS = {
     "target_10_1", "target_9_6", "target_8_1", "target_3_1", "target_3_2",
     "target_7_1", "target_7_2", "target_9_7", "target_9_2", "target_8_2"
@@ -47,8 +46,9 @@ MANUAL_HARD_TARGETS = {
 # Blend controls
 AUTO_TUNE_BLEND_WEIGHT = True
 USE_PER_TARGET_BLEND = True
-MIN_OOF_GAIN_FOR_OVR = 0.0005  # if OvR OOF AUC not better than Multi by this margin -> fallback to Multi
-DEFAULT_BLEND_WEIGHT_MULTI = 0.7
+MIN_OOF_GAIN_FOR_OVR = 0.0003
+BLEND_GRID = np.array([0.0, 0.25, 0.5, 0.75, 1.0])  # regularized grid to reduce overfit
+DEFAULT_BLEND_WEIGHT_MULTI = 0.8
 
 # Feature hygiene
 DROP_CONST_FEATURES = True
@@ -207,17 +207,17 @@ def train_multilabel_ensemble(
             model = CatBoostClassifier(
                 loss_function="MultiLogloss",
                 eval_metric="MultiLogloss",
-                iterations=6500,
-                learning_rate=0.032,
+                iterations=5600,
+                learning_rate=0.035,
                 depth=8,
-                l2_leaf_reg=9.0,
-                random_strength=1.2,
-                bagging_temperature=0.8,
+                l2_leaf_reg=10.0,
+                random_strength=1.25,
+                bagging_temperature=0.85,
                 border_count=254,
                 bootstrap_type="Bayesian",
                 leaf_estimation_iterations=5,
                 od_type="Iter",
-                od_wait=300,
+                od_wait=260,
                 random_seed=seed,
                 task_type="GPU",
                 verbose=300,
@@ -237,10 +237,10 @@ def train_multilabel_ensemble(
 
 def ovr_params_for_target(prevalence: float) -> Dict[str, float]:
     if prevalence <= 0.002:
-        return {"iterations": 4500, "depth": 7, "learning_rate": 0.03, "l2_leaf_reg": 10.0, "od_wait": 180}
+        return {"iterations": 4200, "depth": 7, "learning_rate": 0.03, "l2_leaf_reg": 10.0, "od_wait": 170}
     if prevalence <= 0.01:
-        return {"iterations": 3200, "depth": 7, "learning_rate": 0.033, "l2_leaf_reg": 9.0, "od_wait": 160}
-    return {"iterations": 2200, "depth": 6, "learning_rate": 0.036, "l2_leaf_reg": 8.0, "od_wait": 140}
+        return {"iterations": 3000, "depth": 7, "learning_rate": 0.033, "l2_leaf_reg": 9.0, "od_wait": 150}
+    return {"iterations": 2000, "depth": 6, "learning_rate": 0.036, "l2_leaf_reg": 8.0, "od_wait": 130}
 
 
 def train_ovr_selected_targets(
@@ -252,15 +252,12 @@ def train_ovr_selected_targets(
     n_folds: int,
     selected_targets: List[str],
     prevalence: pd.Series,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, float], Dict[str, float]]:
+) -> Tuple[np.ndarray, np.ndarray]:
     target_cols = list(y_train.columns)
     n_targets = len(target_cols)
 
     test_pred = np.full((x_test.shape[0], n_targets), np.nan, dtype=np.float64)
     oof_pred = np.full((x_train.shape[0], n_targets), np.nan, dtype=np.float64)
-
-    ovr_auc_by_target: Dict[str, float] = {}
-    multi_auc_placeholder: Dict[str, float] = {}
 
     target_to_idx = {t: i for i, t in enumerate(target_cols)}
 
@@ -314,9 +311,8 @@ def train_ovr_selected_targets(
 
         oof_pred[:, target_idx] = fold_oof
         test_pred[:, target_idx] = pred_acc_test / float(models_count)
-        ovr_auc_by_target[target_name] = safe_auc(y_col, sigmoid(fold_oof))
 
-    return oof_pred, test_pred, ovr_auc_by_target, multi_auc_placeholder
+    return oof_pred, test_pred
 
 
 def find_best_blend_weight_per_target(
@@ -327,7 +323,6 @@ def find_best_blend_weight_per_target(
 ) -> Tuple[np.ndarray, float, pd.DataFrame]:
     y_arr = y_true.values
     n_targets = y_arr.shape[1]
-    weights = np.linspace(0.0, 1.0, 21)
 
     p_multi = sigmoid(pred_multi_raw)
     p_ovr = sigmoid(pred_ovr_raw)
@@ -350,9 +345,9 @@ def find_best_blend_weight_per_target(
             rows.append({"target": target_names[j], "best_weight_multi": 1.0, "oof_auc": auc_multi, "ovr_used": 0})
             continue
 
-        best_w_j = 0.5
-        best_auc_j = -1.0
-        for w in weights:
+        best_w_j = 1.0
+        best_auc_j = auc_multi
+        for w in BLEND_GRID:
             pj = w * p_multi[:, j] + (1.0 - w) * p_ovr[:, j]
             auc_j = safe_auc(yj, pj)
             if auc_j > best_auc_j:
@@ -360,7 +355,7 @@ def find_best_blend_weight_per_target(
                 best_w_j = float(w)
 
         best_weights[j] = best_w_j
-        rows.append({"target": target_names[j], "best_weight_multi": best_w_j, "oof_auc": best_auc_j, "ovr_used": 1})
+        rows.append({"target": target_names[j], "best_weight_multi": best_w_j, "oof_auc": best_auc_j, "ovr_used": int(best_w_j < 1.0)})
 
     p_ovr_filled = np.where(np.isnan(p_ovr), p_multi, p_ovr)
     p_blend = p_multi * best_weights.reshape(1, -1) + p_ovr_filled * (1.0 - best_weights.reshape(1, -1))
@@ -413,7 +408,7 @@ def main() -> None:
         n_folds=MULTI_FOLDS,
     )
 
-    oof_ovr_raw, test_ovr_raw, _, _ = train_ovr_selected_targets(
+    oof_ovr_raw, test_ovr_raw = train_ovr_selected_targets(
         x_train=x_train,
         y_train=y_train,
         x_test=x_test,
